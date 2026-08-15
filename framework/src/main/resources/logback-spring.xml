@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+
+    <!-- Include Spring Boot's default logback configuration -->
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+
+    <!-- MDC keys used by the resilient consumer framework -->
+    <property name="MDC_FIELDS" value="correlationId,topic,partition,offset,pipelineStage"/>
+
+    <!-- Console appender with structured JSON output using LogstashEncoder -->
+    <appender name="CONSOLE_JSON" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <!-- Include standard fields: timestamp, level, logger_name, message, thread_name -->
+            <includeCallerData>false</includeCallerData>
+            <includeMdcKeyName>correlationId</includeMdcKeyName>
+            <includeMdcKeyName>topic</includeMdcKeyName>
+            <includeMdcKeyName>partition</includeMdcKeyName>
+            <includeMdcKeyName>offset</includeMdcKeyName>
+            <includeMdcKeyName>pipelineStage</includeMdcKeyName>
+            <timeZone>UTC</timeZone>
+            <timestampPattern>yyyy-MM-dd'T'HH:mm:ss.SSS'Z'</timestampPattern>
+        </encoder>
+    </appender>
+
+    <!-- Plain text console appender for local development (activate with "dev" profile) -->
+    <appender name="CONSOLE_PLAIN" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${CONSOLE_LOG_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!--
+    Optional file appender for production use (uncomment and configure path as needed):
+
+    <appender name="FILE_JSON" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>/var/log/resilient-consumer/application.json</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>/var/log/resilient-consumer/application-%d{yyyy-MM-dd}.%i.json.gz</fileNamePattern>
+            <maxFileSize>100MB</maxFileSize>
+            <maxHistory>30</maxHistory>
+            <totalSizeCap>3GB</totalSizeCap>
+        </rollingPolicy>
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <includeMdcKeyName>correlationId</includeMdcKeyName>
+            <includeMdcKeyName>topic</includeMdcKeyName>
+            <includeMdcKeyName>partition</includeMdcKeyName>
+            <includeMdcKeyName>offset</includeMdcKeyName>
+            <includeMdcKeyName>pipelineStage</includeMdcKeyName>
+            <timeZone>UTC</timeZone>
+            <timestampPattern>yyyy-MM-dd'T'HH:mm:ss.SSS'Z'</timestampPattern>
+        </encoder>
+    </appender>
+    -->
+
+    <!-- Default profile: JSON structured logging -->
+    <springProfile name="default | prod | staging">
+        <root level="INFO">
+            <appender-ref ref="CONSOLE_JSON"/>
+            <!-- <appender-ref ref="FILE_JSON"/> -->
+        </root>
+    </springProfile>
+
+    <!-- Dev profile: plain text for readability -->
+    <springProfile name="dev">
+        <root level="DEBUG">
+            <appender-ref ref="CONSOLE_PLAIN"/>
+        </root>
+    </springProfile>
+
+    <!-- Framework-specific logger levels -->
+    <logger name="com.framework.resilient" level="INFO"/>
+    <logger name="org.apache.kafka" level="WARN"/>
+
+</configuration>

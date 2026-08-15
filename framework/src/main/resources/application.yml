@@ -1,0 +1,45 @@
+resilient:
+  consumer:
+    poll-timeout: 100ms
+    max-poll-records: 500
+    shutdown-timeout: 30s
+    rebalance-commit-timeout: 5s
+    state-persistence-timeout: 5s
+    state-restoration-timeout: 10s
+    startup-restoration-timeout: 30s
+
+    circuit-breaker:
+      error-rate-threshold: 0.5
+      latency-threshold: 5000ms
+      cooldown-period: 30s
+      probe-batch-size: 10
+      probe-batch-timeout: 30s
+      detection-latency-target: 2s
+      reaction-latency-target: 1s
+
+    health-monitor:
+      sliding-window-size: 60s
+      evaluation-interval: 1s
+
+    reorder-buffer:
+      max-buffer-size: 10000
+      resume-threshold: 0.8
+      reorder-timeout: 5s
+
+    deduplication:
+      retention-period: 72h
+      eviction-interval: 1h
+      health-check-interval: 5s
+
+    dlq:
+      max-retry-count: 3
+      initial-backoff: 1s
+      max-backoff: 60s
+      max-buffer-size: 1000
+      max-dlq-retry-attempts: 10
+      default-topic: "${spring.kafka.consumer.group-id:default-group}.dlq.unclassified"
+      topic-mappings:
+        DESERIALIZATION: "${spring.kafka.consumer.group-id:default-group}.dlq.deserialization"
+        VALIDATION: "${spring.kafka.consumer.group-id:default-group}.dlq.validation"
+        TRANSIENT: "${spring.kafka.consumer.group-id:default-group}.dlq.transient"
+        PERMANENT: "${spring.kafka.consumer.group-id:default-group}.dlq.permanent"

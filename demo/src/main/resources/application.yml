@@ -1,0 +1,76 @@
+spring:
+  application:
+    name: payment-demo
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: payment-demo-group
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.ByteArrayDeserializer
+
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus,info
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+
+# Demo-specific configuration
+demo:
+  topic: payment-events
+  failure-mode: NONE
+
+# Framework properties tuned for faster demo feedback
+resilient:
+  consumer:
+    poll-timeout: 100ms
+    max-poll-records: 100
+    shutdown-timeout: 10s
+    rebalance-commit-timeout: 3s
+    state-persistence-timeout: 3s
+    state-restoration-timeout: 5s
+    startup-restoration-timeout: 10s
+
+    circuit-breaker:
+      error-rate-threshold: 0.5
+      latency-threshold: 3000ms
+      cooldown-period: 10s
+      probe-batch-size: 5
+      probe-batch-timeout: 10s
+      detection-latency-target: 1s
+      reaction-latency-target: 500ms
+
+    health-monitor:
+      sliding-window-size: 15s
+      evaluation-interval: 1s
+
+    reorder-buffer:
+      max-buffer-size: 1000
+      resume-threshold: 0.8
+      reorder-timeout: 3s
+
+    deduplication:
+      retention-period: 1h
+      eviction-interval: 5m
+      health-check-interval: 3s
+
+    dlq:
+      max-retry-count: 3
+      initial-backoff: 500ms
+      max-backoff: 10s
+      max-buffer-size: 100
+      max-dlq-retry-attempts: 5
+      default-topic: payment-demo-group.dlq.unclassified
+      topic-mappings:
+        DESERIALIZATION: payment-demo-group.dlq.deserialization
+        VALIDATION: payment-demo-group.dlq.validation
+        TRANSIENT: payment-demo-group.dlq.transient
+        PERMANENT: payment-demo-group.dlq.permanent
