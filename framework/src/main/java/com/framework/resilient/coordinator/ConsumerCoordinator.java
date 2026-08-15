@@ -325,8 +325,9 @@ public class ConsumerCoordinator<T> implements Lifecycle, ConsumerRebalanceListe
                     consumer.pause(Collections.singleton(partition));
                     log.info("Paused partition {} — circuit breaker OPEN", partition);
                 }
-                // Track offset so we don't re-process this record after resume
-                trackOffset(partition, record.offset());
+                // Do NOT commit offset here — the record is not processed or DLQ'd.
+                // When the partition resumes (HALF_OPEN probe), this record will be re-delivered.
+                // This ensures no data loss: the message is retried after cooldown, not silently dropped.
                 return;
             }
 
@@ -515,14 +516,36 @@ public class ConsumerCoordinator<T> implements Lifecycle, ConsumerRebalanceListe
 
     // ========================= Pause/Resume =========================
 
+    /**
+     * Pauses consumption for a partition. Thread-safe: if called from a non-poll thread,
+     * the action is enqueued and executed on the poll thread at the next iteration.
+     */
     public void pausePartition(TopicPartition partition) {
-        consumer.pause(Collections.singleton(partition));
-        log.info("Paused partition {}", partition);
+        if (Thread.currentThread() == pollThread) {
+            consumer.pause(Collections.singleton(partition));
+            log.info("Paused partition {}", partition);
+        } else {
+            consumerActions.add(() -> {
+                consumer.pause(Collections.singleton(partition));
+                log.info("Paused partition {} (via command queue)", partition);
+            });
+        }
     }
 
+    /**
+     * Resumes consumption for a partition. Thread-safe: if called from a non-poll thread,
+     * the action is enqueued and executed on the poll thread at the next iteration.
+     */
     public void resumePartition(TopicPartition partition) {
-        consumer.resume(Collections.singleton(partition));
-        log.info("Resumed partition {}", partition);
+        if (Thread.currentThread() == pollThread) {
+            consumer.resume(Collections.singleton(partition));
+            log.info("Resumed partition {}", partition);
+        } else {
+            consumerActions.add(() -> {
+                consumer.resume(Collections.singleton(partition));
+                log.info("Resumed partition {} (via command queue)", partition);
+            });
+        }
     }
 
     // ========================= ConsumerRebalanceListener =========================
@@ -530,6 +553,11 @@ public class ConsumerCoordinator<T> implements Lifecycle, ConsumerRebalanceListe
     @Override
     public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
         log.info("Partitions revoked: {}", partitions);
+
+        // Update assignment snapshot immediately (this callback runs on the poll thread)
+        Set<TopicPartition> remaining = new java.util.HashSet<>(assignedPartitionsSnapshot.get());
+        remaining.removeAll(partitions);
+        assignedPartitionsSnapshot.set(Set.copyOf(remaining));
 
         // Flush any pending batched offsets before revocation
         flushPendingOffsets();
@@ -572,6 +600,11 @@ public class ConsumerCoordinator<T> implements Lifecycle, ConsumerRebalanceListe
     @Override
     public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
         log.info("Partitions assigned: {}", partitions);
+
+        // Update assignment snapshot immediately (this callback runs on the poll thread)
+        Set<TopicPartition> updated = new java.util.HashSet<>(assignedPartitionsSnapshot.get());
+        updated.addAll(partitions);
+        assignedPartitionsSnapshot.set(Set.copyOf(updated));
 
         for (TopicPartition partition : partitions) {
             try {
