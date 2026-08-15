@@ -1,150 +1,221 @@
 # Kafka Resilient Consumer Framework
 
-A domain-generic Java library that isolates unhealthy Kafka partitions using per-partition circuit breakers while maintaining continuous processing of healthy partitions.
+**Problem**: In a standard Kafka consumer, a single "poison pill" message or a slow downstream dependency on one partition stalls processing for ALL partitions on that instance — because they share one poll loop. In production at scale, this means one bad tenant or one database shard going slow cascades into full consumer lag across the entire consumer group.
+
+**Solution**: This framework introduces **partition-level failure isolation** using Kafka's native `pause()`/`resume()` API. Each partition gets its own circuit breaker, health monitor, reorder buffer, and deduplication state. When one partition degrades, only that partition pauses — the other partitions continue processing normally.
 
 ---
 
+## Why This Exists
+
+I built this after observing a recurring pattern in event-driven systems: Kafka consumers that either fail completely or succeed completely, with nothing in between. The Kafka client API gives you `pause()` and `resume()` at the partition level, but almost nobody uses them for intelligent failure isolation. Instead, teams build thread-per-partition architectures (complex), use Kafka Streams (heavyweight for simple consumers), or just let the whole consumer restart (losing progress).
+
+This framework is the middle ground: **a single-threaded poll loop with per-partition intelligence**.
+
+## Processing Pipeline
+
+```
+Record from poll()
+  → Deserialize (fail? → DLQ immediately)
+  → Circuit breaker check (partition OPEN? → skip, wait for probe)
+  → Reorder buffer (out-of-sequence? → buffer until sequence gap fills)
+  → Deduplication (already processed? → skip, commit offset)
+  → Business logic handler (transient fail? → retry with backoff → DLQ)
+  → Record offset for batched commit
+```
+
+Each record goes through this pipeline on the single `resilient-consumer-poll` thread. No concurrent writes, no lock contention, no visibility issues.
+
 ## Architecture
 
-```mermaid
-flowchart LR
-    P[Producer] --> K[Kafka]
-    K --> CC[Consumer Coordinator]
-    CC --> CB[Circuit Breaker]
-    CB --> RB[Reorder Buffer]
-    RB --> DD[Deduplication]
-    DD --> BH[Business Handler]
-    BH --> CO[Commit Offset]
-    CB -->|unhealthy| DLQ[Dead Letter Queue]
-    BH -->|permanent failure| DLQ
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Consumer Coordinator                          │
+│                                                                 │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
+│  │   Health     │  │   Circuit    │  │   Reorder Buffer     │  │
+│  │   Monitor    │──│   Breaker    │  │   (per partition)    │  │
+│  │   (sliding   │  │   (per       │  │                      │  │
+│  │    window)   │  │   partition) │  │   Sequence tracking  │  │
+│  └──────────────┘  └──────────────┘  │   Gap detection      │  │
+│                                       │   Timeout flush      │  │
+│  ┌──────────────┐  ┌──────────────┐  └──────────────────────┘  │
+│  │   Dedup      │  │   DLQ        │                             │
+│  │   Engine     │  │   Router     │  ┌──────────────────────┐  │
+│  │   (InMemory  │  │   (error     │  │   Metrics Exporter   │  │
+│  │    or Redis) │  │   classified)│  │   (per-partition     │  │
+│  └──────────────┘  └──────────────┘  │    Prometheus)       │  │
+│                                       └──────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Circuit Breaker State Machine
 
-```mermaid
-stateDiagram-v2
-    [*] --> CLOSED
-    CLOSED --> OPEN : error rate or p99 latency exceeds threshold
-    OPEN --> HALF_OPEN : cooldown period elapsed
-    HALF_OPEN --> CLOSED : probe batch succeeds
-    HALF_OPEN --> OPEN : probe batch fails or times out
+```
+CLOSED ──── error rate > threshold OR p99 latency > threshold ────► OPEN
+  ▲                                                                   │
+  │                                                                   │
+  │ probe batch succeeds                              cooldown elapses│
+  │                                                                   │
+  └──────────── HALF_OPEN ◄───────────────────────────────────────────┘
+                    │
+                    │ probe batch fails
+                    └────────────────────────────────────────────► OPEN
 ```
 
-## Technology Stack
-
-| Technology | Purpose |
-|---|---|
-| Java 17+ | Language (records, sealed interfaces, pattern matching) |
-| Spring Boot 3.2 | Application framework and auto-configuration |
-| Apache Kafka | Event streaming platform |
-| Micrometer + Prometheus | Per-partition metrics and monitoring |
-| Docker Compose | Local development environment |
-| Testcontainers | Integration and benchmark testing |
-| JUnit 5 | Unit and integration tests |
-| Awaitility | Async test assertions |
-| Gradle | Build tool (multi-module) |
+When a partition enters OPEN state, the coordinator calls `consumer.pause(partition)`. Kafka's poll loop continues returning records for other partitions. When cooldown elapses, the coordinator calls `consumer.resume(partition)` and processes a small probe batch. If the probe succeeds, the partition returns to CLOSED.
 
 ## Module Structure
 
 ```
 kafka-resilient-consumer/
-├── framework/      # Zero domain knowledge — reusable library
-├── demo/           # Sample payment-service exercising the framework
-├── benchmarks/     # Performance harness with Testcontainers
-└── docs/adr/       # Architecture Decision Records
+├── framework/      # The library — zero domain knowledge, fully reusable
+├── demo/           # Payment-service exercising the framework end-to-end
+├── benchmarks/     # Performance harness (Testcontainers + JUnit 5)
+└── docs/adr/       # 8 Architecture Decision Records
 ```
-
-| Module | Description |
-|---|---|
-| `framework/` | Reusable library with no domain knowledge. Contains coordinator, circuit breaker, reorder buffer, deduplication, DLQ router, and metrics components. |
-| `demo/` | Sample payment-service that exercises the framework end-to-end with Docker Compose infrastructure. |
-| `benchmarks/` | Performance harness using Testcontainers to measure throughput, latency, and recovery under controlled failure injection. |
 
 ## Quick Start
 
+**Prerequisites**: Java 21, Docker Desktop
+
 ```bash
-# Build
-./gradlew build
+# 1. Build (skip tests — they need Docker)
+./gradlew build -x test
 
-# Run demo
-cd demo && docker-compose up -d
-./gradlew :demo:bootRun
+# 2. Start Kafka (KRaft mode, no Zookeeper)
+cd demo && docker compose up -d
 
-# View metrics
-open http://localhost:8080/actuator/prometheus
+# 3. Wait for Kafka to become healthy (~30 seconds)
+docker compose ps  # should show "healthy"
+
+# 4. Create topics (if kafka-init didn't run)
+docker exec demo-kafka kafka-topics --bootstrap-server localhost:9092 \
+  --create --if-not-exists --topic payment-events --partitions 6 --replication-factor 1
+
+# 5. Run the demo app
+cd .. && ./gradlew :demo:bootRun
+
+# 6. Produce events
+curl -X POST "http://localhost:8080/produce/sequenced?accountId=acc-001&count=100"
+curl -X POST "http://localhost:8080/produce/out-of-order?accountId=acc-002&count=50"
+curl -X POST "http://localhost:8080/produce/duplicates?accountId=acc-001&seq=5"
+
+# 7. Check metrics
+curl http://localhost:8080/actuator/prometheus | grep resilient_consumer
+
+# 8. Cleanup
+cd demo && docker compose down
 ```
 
-## Key Features
+## Key Design Decisions
 
-- **Per-partition circuit breakers** via Kafka `pause()`/`resume()`
-- **Automatic recovery** with configurable cooldown and probe batches
-- **Out-of-order event reordering** with bounded buffers and backpressure
-- **Application-level deduplication** (not Kafka EOS — see [ADR-004](docs/adr/ADR-004-application-level-dedup-over-kafka-eos.md))
-- **Classified DLQ routing** (deserialization, validation, transient, permanent)
-- **Cooperative sticky rebalance** with state persistence and restoration
-- **Batched offset commits** — accumulates per-partition offsets, commits once per poll batch (not per-record)
-- **Per-partition Micrometer metrics** (Prometheus-compatible)
-- **Structured JSON logging** with correlation IDs across all pipeline stages
-- **Configuration validation at startup** — invalid values produce clear error messages
+| Decision | Why |
+|----------|-----|
+| `pause()`/`resume()` over thread-per-partition | Works with cooperative-sticky rebalance, no rebalance storms, simpler concurrency model |
+| Single-threaded poll loop | No locks, no visibility issues, scales horizontally via consumer instances |
+| Application-level dedup over Kafka EOS | EOS has ~30% throughput overhead and doesn't survive consumer group resets |
+| Reorder before business logic | Business handlers shouldn't need to handle out-of-order delivery |
+| Cooperative sticky rebalance | Minimizes partition migration, preserves circuit breaker state |
+| Redis for cross-instance state | During rebalance, new partition owner can restore CB state without cold start |
+| DLQ error classification | Different error types need different retention, alerting, and replay strategies |
+| Fixed sliding window (not EWMA) | Simpler, O(1) bucket operations, predictable memory |
 
-## Configuration Reference
-
-| Property | Default | Description |
-|---|---|---|
-| `resilient.consumer.circuit-breaker.error-rate-threshold` | `0.5` | Error rate to trigger OPEN state (0.01–1.0) |
-| `resilient.consumer.circuit-breaker.latency-threshold` | `5000ms` | p99 latency threshold (100ms–60000ms) |
-| `resilient.consumer.circuit-breaker.cooldown-period` | `30s` | Time in OPEN before transitioning to HALF_OPEN (5s–300s) |
-| `resilient.consumer.health-monitor.sliding-window-size` | `60s` | Health monitor sliding window duration (10s–300s) |
-| `resilient.consumer.circuit-breaker.probe-batch-size` | `10` | Events consumed during HALF_OPEN probe |
-| `resilient.consumer.reorder-buffer.reorder-timeout` | `5s` | Max wait time for out-of-order events (100ms–60s) |
-| `resilient.consumer.reorder-buffer.max-buffer-size` | `10000` | Max buffered events per partition (100–1000000) |
-| `resilient.consumer.deduplication.retention-period` | `72h` | Idempotency key retention period (24h–168h) |
-| `resilient.consumer.dlq.max-retry-count` | `3` | Retries before DLQ routing (1–10) |
-| `resilient.consumer.shutdown-timeout` | `30s` | Graceful shutdown timeout (5s–120s) |
-
-All properties are validated at startup — invalid values produce clear error messages and prevent the application from starting.
+Full reasoning in [`docs/adr/`](docs/adr/).
 
 ## Extension Points
 
-| Interface | Purpose |
-|---|---|
-| `EventHandler<T>` | Inject business logic — implement to process events with your domain logic |
-| `EventDeserializer<T>` | Convert raw `ConsumerRecord` bytes into `SequencedEvent<T>` with source entity and sequence number |
-| `IdempotencyKeyStore` | Plug in an external deduplication store (default: in-memory; Redis implementation included) |
-| `StateStore` | Plug in persistent state backend (default: file-based JSON; Redis implementation included) |
+```java
+// Your business logic — implement this interface
+public interface EventHandler<T> {
+    ProcessingResult handle(T payload, EventMetadata metadata);
+}
 
-## Architecture Decision Records
+// Your deserialization — convert bytes to domain events
+public interface EventDeserializer<T> {
+    SequencedEvent<T> deserialize(ConsumerRecord<String, byte[]> record);
+}
 
-All ADRs are located in [`docs/adr/`](docs/adr/):
+// Swap dedup backend (default: in-memory; Redis included)
+public interface IdempotencyKeyStore { ... }
 
-| ADR | Decision |
-|---|---|
-| [ADR-001](docs/adr/ADR-001-pause-resume-over-custom-isolation.md) | Why pause()/resume() over custom isolation |
-| [ADR-002](docs/adr/ADR-002-per-partition-circuit-breakers.md) | Why per-partition circuit breakers |
-| [ADR-003](docs/adr/ADR-003-reorder-before-business-logic.md) | Why reorder before business logic |
-| [ADR-004](docs/adr/ADR-004-application-level-dedup-over-kafka-eos.md) | Why application-level deduplication over Kafka EOS |
-| [ADR-005](docs/adr/ADR-005-cooperative-sticky-rebalance.md) | Why cooperative sticky rebalance |
-| [ADR-006](docs/adr/ADR-006-dlq-error-classification.md) | Why DLQ error classification |
-| [ADR-007](docs/adr/ADR-007-single-threaded-poll-loop.md) | Why single-threaded poll loop over thread-per-partition |
-| [ADR-008](docs/adr/ADR-008-redis-for-cross-instance-state.md) | Why Redis for cross-instance state sharing |
+// Swap state persistence (default: file-based JSON; Redis included)
+public interface StateStore { ... }
+```
 
-## Benchmarks
+## Configuration
 
-See [`BENCHMARKS.md`](BENCHMARKS.md) for full results with 95% confidence intervals.
+All properties under `resilient.consumer.*` with validation at startup:
 
-The benchmarking harness uses Testcontainers with a 6-partition Kafka cluster and measures:
+```yaml
+resilient:
+  consumer:
+    circuit-breaker:
+      error-rate-threshold: 0.5       # 0.01–1.0
+      latency-threshold: 5000ms       # p99 threshold
+      cooldown-period: 30s            # OPEN → HALF_OPEN wait
+      probe-batch-size: 10            # events in probe
+    health-monitor:
+      sliding-window-size: 60s        # metric aggregation window
+      evaluation-interval: 1s         # how often to check thresholds
+    reorder-buffer:
+      max-buffer-size: 10000          # per-partition cap
+      reorder-timeout: 5s             # max wait for gap fill
+    deduplication:
+      retention-period: 72h           # key TTL
+    dlq:
+      max-retry-count: 3              # retries before DLQ
+      initial-backoff: 500ms          # exponential backoff start
+```
 
-| Metric | Result |
-|--------|--------|
-| Baseline throughput | ~12,400 events/sec |
-| Throughput degradation (2/6 isolated) | ~35% (linear) |
-| Recovery time (OPEN → CLOSED) | ~31.2s ± 0.8s |
-| Reorder latency (p50 / p99) | 0.02ms / 48.7ms |
-| Dedup latency (p50 / p99) | 0.001ms / 0.008ms |
-| Rebalance duration | ~4.2s ± 1.1s |
-| DLQ routing throughput | ~9,800 events/sec |
-| Memory per buffered event | ~340 bytes |
+## Technology Stack
+
+| Tech | Version | Why |
+|------|---------|-----|
+| Java | 21 | Records, sealed interfaces, pattern matching, virtual threads (future) |
+| Spring Boot | 3.2.5 | Auto-configuration, actuator, property binding |
+| Kafka Client | 3.6.2 | KRaft support, cooperative rebalance protocol |
+| Micrometer | 1.12.5 | Per-partition Prometheus metrics |
+| Testcontainers | 1.19.8 | Isolated integration tests with real Kafka |
+| Gradle | 8.14.2 | Multi-module build, toolchain management |
+
+## Tests
+
+```bash
+# Unit tests (no Docker needed) — 172 tests
+./gradlew :framework:test --tests "com.framework.resilient.circuitbreaker.*" \
+                          --tests "com.framework.resilient.coordinator.*" \
+                          --tests "com.framework.resilient.dedup.*" \
+                          --tests "com.framework.resilient.dlq.*" \
+                          --tests "com.framework.resilient.metrics.*" \
+                          --tests "com.framework.resilient.reorder.*"
+
+# Integration tests (Docker required)
+./gradlew :framework:test --tests "com.framework.resilient.integration.*"
+
+# Benchmarks (Docker required, ~5 minutes)
+./gradlew :benchmarks:test
+```
+
+## What This Demonstrates
+
+For an interviewer evaluating this project:
+
+1. **Kafka internals knowledge** — `pause()`/`resume()`, cooperative-sticky assignment, offset management, consumer group protocol
+2. **Distributed systems patterns** — circuit breakers, sliding windows, exactly-once semantics, state machine design
+3. **Production thinking** — graceful shutdown, state persistence across rebalances, backpressure, structured logging with correlation IDs
+4. **Software engineering** — interfaces for extension, Spring Boot starter auto-configuration, multi-module build, ADRs explaining every trade-off
+5. **Testing discipline** — unit tests with mocks, integration tests with Testcontainers, benchmark harness for performance claims
+
+## Future Work (deliberately deferred)
+
+- EWMA load tracking for more responsive degradation detection
+- Circuit breaker → half-open probe with synthetic health-check events
+- Redis-backed sliding window for cross-instance metric aggregation
+- Configurable retry policies per error classification
+- gRPC health reporting for orchestrator integration
+- Adaptive backoff based on downstream recovery signals
 
 ## License
 
-[MIT](LICENSE)
+MIT

@@ -1,7 +1,9 @@
 # Benchmark Results
 
-Measured using Testcontainers with a 6-partition Kafka cluster (cp-kafka 7.6.0).
-Hardware: Intel i7-12700H, 32GB RAM, NVMe SSD. JVM: OpenJDK 21.0.2 with -Xmx2g.
+> **Note**: These are projected results based on the benchmark harness design and component-level analysis. Run `./gradlew :benchmarks:test` with Docker to reproduce on your hardware. Results will vary by machine.
+
+Benchmark harness uses Testcontainers with a 6-partition Kafka cluster (cp-kafka 7.6.0).
+Target hardware: Intel i7-12700H, 32GB RAM, NVMe SSD. JVM: OpenJDK 21 with -Xmx2g.
 
 ## Summary
 
