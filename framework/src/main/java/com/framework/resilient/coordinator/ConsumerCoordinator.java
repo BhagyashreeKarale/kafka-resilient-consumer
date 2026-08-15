@@ -193,6 +193,10 @@ public class ConsumerCoordinator<T> implements Lifecycle, ConsumerRebalanceListe
         log.info("Shutting down ConsumerCoordinator with timeout {}", timeout);
         running.set(false);
 
+        // Stop background health-check threads FIRST — prevents them from enqueuing
+        // actions to consumerActions after the poll thread exits.
+        deduplicationEngine.stopHealthCheck();
+
         if (pollThread != null) {
             consumer.wakeup();
             try {
@@ -210,7 +214,6 @@ public class ConsumerCoordinator<T> implements Lifecycle, ConsumerRebalanceListe
             performGracefulShutdown();
         }
 
-        deduplicationEngine.stopHealthCheck();
         shutdownLatch.countDown();
         log.info("ConsumerCoordinator shutdown complete");
     }
@@ -413,18 +416,31 @@ public class ConsumerCoordinator<T> implements Lifecycle, ConsumerRebalanceListe
                     trackOffset(partition, event.metadata().offset());
                     return;
                 }
-                log.debug("Transient failure attempt {}/{}, backing off {}",
-                        attempt + 1, maxRetries, backoff);
-                // Bounded backoff on poll thread. Total worst-case blocking time for this event:
-                // sum of geometric series capped at maxBackoff (e.g., 500ms + 1s + 2s = 3.5s for 3 retries).
-                // This is acceptable because: (1) retries are bounded by maxRetryCount (default 3),
-                // (2) per-retry sleep is capped at maxBackoff (default 10s but typically reached only after
-                // many retries), (3) all other partitions' records from THIS poll batch are already processed
-                // or will be in the next poll. For workloads requiring sub-second latency guarantees on
-                // other partitions during retries, move to a scheduled retry queue (future enhancement).
-                long sleepMs = Math.min(backoff.toMillis(), 5000); // Hard cap at 5s per retry
-                try { Thread.sleep(sleepMs); } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
+
+                // Non-blocking retry strategy:
+                // - Immediate retries (backoff <= 50ms): sleep on poll thread (negligible impact)
+                // - Longer backoffs: route to DLQ rather than blocking the poll thread.
+                //   This preserves partition isolation — other partitions are never delayed
+                //   by another partition's transient failures.
+                // Future enhancement: scheduled retry queue that re-inserts events after delay.
+                long sleepMs = Math.min(backoff.toMillis(), dlqProperties.maxBackoff().toMillis());
+                if (sleepMs <= 50) {
+                    try { Thread.sleep(sleepMs); } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                } else {
+                    // Backoff is too long to block poll thread — route to DLQ as transient
+                    // rather than degrading isolation for other partitions.
+                    log.info("Backoff {}ms too long for poll thread, routing to DLQ after {} attempts",
+                            sleepMs, attempt + 1);
+                    Duration latency = Duration.between(startTime, Instant.now());
+                    healthMonitor.recordFailure(partition, latency);
+                    metricsExporter.recordProcessingFailure(partition);
+                    healthMonitor.evaluate(partition);
+                    routeToDlq(null, e, ErrorClassification.TRANSIENT, attempt + 1,
+                            event.sourceEntity(), MDC.get(MDC_CORRELATION_ID));
+                    trackOffset(partition, event.metadata().offset());
                     return;
                 }
                 // Double backoff, cap at max
@@ -465,13 +481,31 @@ public class ConsumerCoordinator<T> implements Lifecycle, ConsumerRebalanceListe
         if (record != null) {
             dlqRouter.route(record, error, classification, retryCount, sourceEntity, correlationId);
         } else {
-            // Event came from reorder buffer (already deserialized) — construct synthetic record
-            // for DLQ routing with minimal metadata. The key information (classification, error,
-            // source entity, correlation ID) is preserved in DLQ headers.
+            // Event came from reorder buffer (already deserialized) — construct enriched record
+            // with full context in headers for DLQ consumers and replay tooling.
+            org.apache.kafka.common.header.internals.RecordHeaders headers =
+                    new org.apache.kafka.common.header.internals.RecordHeaders();
+            if (sourceEntity != null) {
+                headers.add("dlq.source.entity", sourceEntity.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            }
+            if (correlationId != null) {
+                headers.add("dlq.correlation.id", correlationId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            }
+            headers.add("dlq.error.classification", classification.name().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            headers.add("dlq.retry.count", String.valueOf(retryCount).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            headers.add("dlq.error.message",
+                    (error.getMessage() != null ? error.getMessage() : error.getClass().getName())
+                            .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            headers.add("dlq.origin", "reorder-buffer".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
             ConsumerRecord<String, byte[]> syntheticRecord = new ConsumerRecord<>(
-                    "unknown", 0, -1,
+                    "dlq.synthetic", 0, -1,
+                    ConsumerRecord.NO_TIMESTAMP, org.apache.kafka.common.record.TimestampType.NO_TIMESTAMP_TYPE,
+                    -1, -1,
                     sourceEntity != null ? sourceEntity : "unknown",
-                    error.getMessage() != null ? error.getMessage().getBytes() : new byte[0]
+                    error.getMessage() != null ? error.getMessage().getBytes() : new byte[0],
+                    headers,
+                    Optional.empty()
             );
             dlqRouter.route(syntheticRecord, error, classification, retryCount, sourceEntity, correlationId);
         }
