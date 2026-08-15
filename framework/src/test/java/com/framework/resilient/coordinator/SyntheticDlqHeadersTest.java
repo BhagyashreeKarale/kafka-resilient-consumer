@@ -1,61 +1,59 @@
 package com.framework.resilient.coordinator;
 
-import com.framework.resilient.dlq.ErrorClassification;
 import com.framework.resilient.dlq.DLQProperties;
 import com.framework.resilient.dlq.DLQRouter;
+import com.framework.resilient.dlq.DLQRoutingResult;
+import com.framework.resilient.dlq.ErrorClassification;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.header.Headers;
 import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
+import java.time.Instant;
+import java.util.Collections;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.*;
+import static org.mockito.Mockito.mock;
 
+/**
+ * Verifies that the synthetic DLQ path adds the expected headers.
+ */
 public class SyntheticDlqHeadersTest {
 
     @Test
-    public void syntheticDlqHasExpectedHeaders() {
+    public void syntheticDlqHasExpectedHeaders() throws Exception {
         // Arrange
-        DLQRouter mockRouter = mock(DLQRouter.class);
-        DLQProperties props = new DLQProperties();
-        // Create a coordinator but we will call routeToDlq via reflection or by making it package-private.
-        KafkaConsumerStub consumerStub = new KafkaConsumerStub();
+        org.apache.kafka.clients.consumer.KafkaConsumer<String, byte[]> consumerMock = mock(org.apache.kafka.clients.consumer.KafkaConsumer.class);
+        // Create a DLQRouter stub to capture the ProducerRecord passed to route()
+        DLQRouterStub dlqStub = new DLQRouterStub();
+
         ConsumerCoordinator<String> coordinator = new ConsumerCoordinator<>(
-                consumerStub,
+                consumerMock,
                 (payload, meta) -> ProcessingResult.SUCCESS,
-                (record) -> new SequencedEvent<>("entity-1", 1L, "payload", meta(record), null),
+                record -> new SequencedEvent<>("entity-1", 1L, "payload", new EventMetadata(record.topic(), record.partition(), record.offset(), "corr", new RecordHeaders(), Instant.now()), null),
                 mock(PartitionCircuitBreaker.class),
                 mock(PartitionHealthMonitor.class),
                 mock(ReorderBuffer.class),
                 mock(DeduplicationEngine.class),
-                new DLQRouterStub(),
+                dlqStub,
                 mock(MetricsExporter.class),
                 mock(StateStore.class),
                 new CoordinatorProperties(),
                 new DLQProperties(),
-                null
+                Collections.emptyList()
         );
 
-        // Act
-        // Call routeToDlq using a synthetic error path --- use reflection since routeToDlq is private
+        // Act: invoke private routeToDlq with null record to trigger synthetic path
         Throwable error = new RuntimeException("boom");
+        java.lang.reflect.Method m = ConsumerCoordinator.class.getDeclaredMethod("routeToDlq",
+                ConsumerRecord.class, Throwable.class, ErrorClassification.class, int.class, String.class, String.class);
+        m.setAccessible(true);
+        m.invoke(coordinator, null, error, ErrorClassification.TRANSIENT, 1, "entity-1", "corr-1");
 
-        try {
-            java.lang.reflect.Method m = ConsumerCoordinator.class.getDeclaredMethod("routeToDlq",
-                    ConsumerRecord.class, Throwable.class, ErrorClassification.class, int.class, String.class, String.class);
-            m.setAccessible(true);
-            m.invoke(coordinator, null, error, ErrorClassification.TRANSIENT, 1, "entity-1", "corr-1");
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
-
-        // Assert: our DLQRouterStub captured the last routed record
-        ConsumerRecord<String, byte[]> last = ((DLQRouterStub) coordinator.dlqRouter).lastRecord;
+        // Assert
+        ConsumerRecord<String, byte[]> last = dlqStub.lastRecord;
         assertThat(last).isNotNull();
         Headers headers = last.headers();
         assertThat(new String(headers.lastHeader("dlq.source.entity").value(), StandardCharsets.UTF_8)).isEqualTo("entity-1");
@@ -65,11 +63,7 @@ public class SyntheticDlqHeadersTest {
         assertThat(new String(headers.lastHeader("dlq.origin").value(), StandardCharsets.UTF_8)).isEqualTo("reorder-buffer");
     }
 
-    // Helper stubs and factories
-    private static EventMetadata meta(ConsumerRecord<String, byte[]> r) {
-        return new EventMetadata(r.topic(), r.partition(), r.offset(), "corr", new RecordHeaders(), java.time.Instant.now());
-    }
-
+    // DLQRouter stub that captures the last routed record
     private static class DLQRouterStub extends DLQRouter {
         public ConsumerRecord<String, byte[]> lastRecord;
 
@@ -78,17 +72,11 @@ public class SyntheticDlqHeadersTest {
         }
 
         @Override
-        public com.framework.resilient.dlq.DLQRoutingResult route(ConsumerRecord<String, byte[]> originalRecord,
-                                                                   Throwable error, com.framework.resilient.dlq.ErrorClassification classification,
-                                                                   int retryCount, String sourceEntity, String correlationId) {
+        public DLQRoutingResult route(ConsumerRecord<String, byte[]> originalRecord,
+                                      Throwable error, ErrorClassification classification,
+                                      int retryCount, String sourceEntity, String correlationId) {
             this.lastRecord = originalRecord;
-            return com.framework.resilient.dlq.DLQRoutingResult.ROUTED;
+            return DLQRoutingResult.ROUTED;
         }
     }
-
-    // Minimal KafkaConsumer stub for unit tests
-    private static class KafkaConsumerStub extends org.apache.kafka.clients.consumer.KafkaConsumer<String, byte[]> {
-        public KafkaConsumerStub() {
-            super(java.util.Map.of(), null);
-        }
-    }
+}
