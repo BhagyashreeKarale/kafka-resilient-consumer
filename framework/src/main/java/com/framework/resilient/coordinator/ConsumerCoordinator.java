@@ -37,9 +37,11 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Central orchestrator for the resilient Kafka consumer framework.
@@ -88,6 +90,14 @@ public class ConsumerCoordinator<T> implements Lifecycle, ConsumerRebalanceListe
 
     // Batched offset tracking — commit at end of poll batch, not per-record
     private final Map<TopicPartition, OffsetAndMetadata> pendingOffsets = new ConcurrentHashMap<>();
+
+    // Thread-safe command queue: other threads enqueue actions here, poll thread drains and executes.
+    // This ensures all KafkaConsumer interactions happen on the poll thread (KafkaConsumer is NOT thread-safe).
+    private final ConcurrentLinkedQueue<Runnable> consumerActions = new ConcurrentLinkedQueue<>();
+
+    // Thread-safe snapshot of assigned partitions — updated on poll thread, read by health-check threads.
+    private final AtomicReference<Set<TopicPartition>> assignedPartitionsSnapshot =
+            new AtomicReference<>(Set.of());
 
     /**
      * Constructs a ConsumerCoordinator with all required dependencies.
@@ -169,9 +179,12 @@ public class ConsumerCoordinator<T> implements Lifecycle, ConsumerRebalanceListe
         pollThread = new Thread(this::pollLoop, "resilient-consumer-poll");
         pollThread.setDaemon(true);
         pollThread.start();
+        // Health-check callbacks enqueue actions to the command queue instead of calling
+        // KafkaConsumer directly — preserving thread-safety (KafkaConsumer is NOT thread-safe).
         deduplicationEngine.startHealthCheck(
-                partitions -> partitions.forEach(this::pausePartition),
-                () -> consumer.assignment()
+                partitions -> partitions.forEach(tp ->
+                        consumerActions.add(() -> pausePartition(tp))),
+                () -> assignedPartitionsSnapshot.get()
         );
     }
 
@@ -220,7 +233,20 @@ public class ConsumerCoordinator<T> implements Lifecycle, ConsumerRebalanceListe
 
             while (running.get()) {
                 try {
+                    // Drain command queue — execute any actions enqueued by background threads
+                    // (e.g., dedup health-check requesting pause). This ensures all KafkaConsumer
+                    // interactions happen on the poll thread.
+                    Runnable cmd;
+                    while ((cmd = consumerActions.poll()) != null) {
+                        try { cmd.run(); } catch (Exception e) {
+                            log.warn("Consumer action failed", e);
+                        }
+                    }
+
                     ConsumerRecords<String, byte[]> records = consumer.poll(properties.pollTimeout());
+
+                    // Update assignment snapshot for thread-safe reads by background threads
+                    assignedPartitionsSnapshot.set(Set.copyOf(consumer.assignment()));
 
                     for (ConsumerRecord<String, byte[]> record : records) {
                         if (!running.get()) break;
@@ -233,6 +259,13 @@ public class ConsumerCoordinator<T> implements Lifecycle, ConsumerRebalanceListe
                     // Post-batch maintenance
                     circuitBreaker.evaluateCooldowns();
                     for (TopicPartition tp : consumer.assignment()) {
+                        // Resume partitions whose circuit breaker transitioned to HALF_OPEN
+                        if (circuitBreaker.getState(tp) == CircuitState.HALF_OPEN
+                                && consumer.paused().contains(tp)) {
+                            consumer.resume(Collections.singleton(tp));
+                            log.info("Resumed partition {} for probe (HALF_OPEN)", tp);
+                        }
+
                         List<SequencedEvent<T>> timedOut = reorderBuffer.releaseTimedOut(tp);
                         if (!timedOut.isEmpty()) {
                             processReleasedEvents(tp, timedOut);
@@ -285,7 +318,15 @@ public class ConsumerCoordinator<T> implements Lifecycle, ConsumerRebalanceListe
             // Stage 2: Circuit breaker check
             MDC.put(MDC_PIPELINE_STAGE, "CIRCUIT_BREAKER_CHECK");
             if (!circuitBreaker.isPartitionHealthy(partition)) {
-                log.debug("Partition {} circuit breaker not healthy, skipping", partition);
+                // Partition is degraded — pause it so poll() stops returning records for it.
+                // The partition will be resumed in post-batch maintenance when cooldown elapses
+                // and the circuit breaker transitions to HALF_OPEN.
+                if (!consumer.paused().contains(partition)) {
+                    consumer.pause(Collections.singleton(partition));
+                    log.info("Paused partition {} — circuit breaker OPEN", partition);
+                }
+                // Track offset so we don't re-process this record after resume
+                trackOffset(partition, record.offset());
                 return;
             }
 
@@ -307,7 +348,8 @@ public class ConsumerCoordinator<T> implements Lifecycle, ConsumerRebalanceListe
                             partition, dupCandidate.sourceEntity(), dupCandidate.sequenceNumber());
                     if (dedupResult == DeduplicationResult.DUPLICATE) {
                         log.debug("Duplicate detected for entity={} seq={}", dupCandidate.sourceEntity(), dupCandidate.sequenceNumber());
-                        trackOffset(partition, record.offset());
+                        // Use the duplicate candidate's own offset, not the current record's offset
+                        trackOffset(partition, dupCandidate.metadata().offset());
                     }
                 }
             }
@@ -372,10 +414,15 @@ public class ConsumerCoordinator<T> implements Lifecycle, ConsumerRebalanceListe
                 }
                 log.debug("Transient failure attempt {}/{}, backing off {}",
                         attempt + 1, maxRetries, backoff);
-                // Non-blocking backoff using virtual thread sleep (Java 21)
-                // This still runs on the poll thread but the sleep is short and bounded.
-                // For production with longer backoffs, consider a retry queue.
-                try { Thread.sleep(backoff.toMillis()); } catch (InterruptedException ie) {
+                // Bounded backoff on poll thread. Total worst-case blocking time for this event:
+                // sum of geometric series capped at maxBackoff (e.g., 500ms + 1s + 2s = 3.5s for 3 retries).
+                // This is acceptable because: (1) retries are bounded by maxRetryCount (default 3),
+                // (2) per-retry sleep is capped at maxBackoff (default 10s but typically reached only after
+                // many retries), (3) all other partitions' records from THIS poll batch are already processed
+                // or will be in the next poll. For workloads requiring sub-second latency guarantees on
+                // other partitions during retries, move to a scheduled retry queue (future enhancement).
+                long sleepMs = Math.min(backoff.toMillis(), 5000); // Hard cap at 5s per retry
+                try { Thread.sleep(sleepMs); } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
                     return;
                 }
